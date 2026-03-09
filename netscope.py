@@ -60,28 +60,53 @@ def banner():
   ██║╚██╗██║██╔══╝     ██║   ╚════██║██║     ██║   ██║██╔═══╝ ██╔══╝
   ██║ ╚████║███████╗   ██║   ███████║╚██████╗╚██████╔╝██║     ███████╗
   ╚═╝  ╚═══╝╚══════╝   ╚═╝   ╚══════╝ ╚═════╝ ╚═════╝ ╚═╝     ╚══════╝\033[0m
-\033[90m  \033[0m
+\033[90m  Port Scanner  |  Solo usar en redes con permiso\033[0m
 """)
 
 
+def grab_banner(ip, port):
+    """Se conecta al servicio y escucha su banner de bienvenida (versión)."""
+    # Algunos servicios necesitan un saludo para responder
+    probes = {
+        80:   b"GET / HTTP/1.0\r\n\r\n",
+        8080: b"GET / HTTP/1.0\r\n\r\n",
+        8443: b"GET / HTTP/1.0\r\n\r\n",
+    }
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(2)
+        sock.connect((ip, port))
+
+        probe = probes.get(port, b"\r\n")
+        sock.send(probe)
+
+        raw = sock.recv(1024).decode("utf-8", errors="ignore").strip()
+        sock.close()
+
+        # Quedarnos con la primera línea útil
+        line = raw.splitlines()[0] if raw else ""
+        return line[:80] if line else None
+    except:
+        return None
+
+
 def scan_port(ip, port):
-    """Intenta conectar a un puerto. Devuelve el puerto si está abierto."""
+    """Escanea un puerto. Devuelve (puerto, version) si está abierto."""
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(0.5)
         if sock.connect_ex((ip, port)) == 0:
-            return port
+            sock.close()
+            version = grab_banner(ip, port)
+            return (port, version)
     except:
         pass
-    finally:
-        sock.close()
     return None
 
 
 def main():
     banner()
 
-    # Argumentos básicos
     if len(sys.argv) < 2:
         print(f"  Uso: python3 netscope.py <objetivo> [inicio] [fin]")
         print(f"  Ej:  python3 netscope.py 192.168.1.1 1 1000\n")
@@ -99,7 +124,6 @@ def main():
         print(f"  \033[91m[✗] No se pudo resolver: {target}\033[0m\n")
         sys.exit(1)
 
-    # Info del escaneo
     start = datetime.now()
     print(f"  \033[90mNmap scan report for \033[0m\033[1m\033[97m{target}\033[0m \033[90m({ip})\033[0m")
     print(f"  \033[90mEscaneando {len(ports)} puertos...\033[0m\n")
@@ -113,28 +137,28 @@ def main():
             if result:
                 open_ports.append(result)
 
-    open_ports.sort()
+    open_ports.sort(key=lambda x: x[0])
 
     # Mostrar resultados
     if not open_ports:
         print(f"  \033[93mNo se encontraron puertos abiertos.\033[0m")
     else:
-        print(f"  \033[90m{'PORT':<16} {'STATE':<10} {'SERVICE'}\033[0m")
-        print(f"  \033[90m{'─'*50}\033[0m")
+        print(f"  \033[90m{'PORT':<16} {'STATE':<10} {'SERVICE':<16} VERSION\033[0m")
+        print(f"  \033[90m{'─'*70}\033[0m")
 
-        for port in open_ports:
-            name, color = SERVICES.get(port, ("unknown", WHITE))
-            port_str    = f"{BOLD}{color}{port}/tcp{RESET}"
-            state_str   = f"{GREEN}open{RESET}"
-            service_str = f"{color}{name}{RESET}"
-            print(f"  {port_str:<38} {state_str:<18} {service_str}")
+        for port, version in open_ports:
+            name, color  = SERVICES.get(port, ("unknown", WHITE))
+            port_str     = f"{BOLD}{color}{port}/tcp{RESET}"
+            state_str    = f"{GREEN}open{RESET}"
+            service_str  = f"{color}{name}{RESET}"
+            version_str  = f"{GRAY}{version}{RESET}" if version else ""
+            print(f"  {port_str:<38} {state_str:<18} {service_str:<34} {version_str}")
 
             if port in DANGEROUS:
                 sev  = "CRITICAL" if port in [6379, 27017, 445, 23] else "HIGH"
                 scol = RED if sev == "CRITICAL" else YELLOW
                 print(f"  \033[90m|_\033[0m {scol}[{sev}]{RESET} \033[90m{DANGEROUS[port]}\033[0m")
 
-    # Footer
     elapsed = (datetime.now() - start).total_seconds()
     print(f"\n  \033[90mNetscope done: scanned in {elapsed:.2f}s — {len(open_ports)} open / {len(ports)} total\033[0m\n")
 
