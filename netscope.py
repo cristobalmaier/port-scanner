@@ -146,13 +146,23 @@ def main():
         print(f"  \033[90m{'PORT':<16} {'STATE':<10} {'SERVICE':<16} VERSION\033[0m")
         print(f"  \033[90m{'─'*70}\033[0m")
 
+        COL_PORT    = 16
+        COL_STATE   = 10
+        COL_SERVICE = 16
+
         for port, version in open_ports:
-            name, color  = SERVICES.get(port, ("unknown", WHITE))
-            port_str     = f"{BOLD}{color}{port}/tcp{RESET}"
-            state_str    = f"{GREEN}open{RESET}"
-            service_str  = f"{color}{name}{RESET}"
-            version_str  = f"{GRAY}{version}{RESET}" if version else ""
-            print(f"  {port_str:<38} {state_str:<18} {service_str:<34} {version_str}")
+            name, color = SERVICES.get(port, ("unknown", WHITE))
+            # Padding sobre texto plano, color aplicado encima
+            p_port    = f"{port}/tcp"
+            p_state   = "open"
+            p_service = name
+            p_version = version or ""
+            print(
+                f"  {BOLD}{color}{p_port:<{COL_PORT}}{RESET}"
+                f" {GREEN}{p_state:<{COL_STATE}}{RESET}"
+                f" {color}{p_service:<{COL_SERVICE}}{RESET}"
+                f" {GRAY}{p_version}{RESET}"
+            )
 
             if port in DANGEROUS:
                 sev  = "CRITICAL" if port in [6379, 27017, 445, 23] else "HIGH"
