@@ -22,7 +22,7 @@ Scanner de puertos escrito en Python puro. Detecta puertos abiertos, identifica 
 
 ---
 
-## ▶Uso
+## ▶ Uso
 
 ```bash
 python3 netscope.py <objetivo> [puerto_inicio] [puerto_fin]
@@ -89,7 +89,7 @@ Netscope muestra advertencias automáticas para los siguientes puertos:
 
 ---
 
-## Cómo funciona (conceptos clave)
+## Cómo funciona
 
 ### 1. TCP Connect Scan
 Netscope intenta establecer una conexión TCP completa con cada puerto usando `socket.connect_ex()`. Si la conexión es exitosa (retorna `0`), el puerto está **abierto**.
