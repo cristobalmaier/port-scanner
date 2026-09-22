@@ -1,4 +1,4 @@
-# 🔍 NETSCOPE — Port Scanner
+# NETSCOPE — Port Scanner
 
 ```
   ███╗   ██╗███████╗████████╗███████╗ ██████╗ ██████╗ ██████╗ ███████╗
@@ -22,7 +22,7 @@ Scanner de puertos escrito en Python puro. Detecta puertos abiertos, identifica 
 
 ---
 
-## ▶ Uso
+## Uso
 
 ```bash
 python3 netscope.py <objetivo> [puerto_inicio] [puerto_fin]
