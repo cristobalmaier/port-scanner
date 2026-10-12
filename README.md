@@ -1,46 +1,50 @@
 # netscope
 
 Escáner de puertos **rápido y sencillo** en un solo archivo, sin dependencias
-(solo la librería estándar de Python 3.10+). Pensado como alternativa ligera a
-nmap para el reconocimiento rápido: encontrás puertos abiertos, el servicio y su
-versión, y te marca los riesgos obvios.
+(solo la librería estándar de Python 3.10+). Alternativa ligera a nmap para
+reconocimiento rápido: te dice qué puertos están abiertos, qué servicio corre y
+su versión, y marca los riesgos obvios.
 
 ```bash
 netscope 192.168.1.10
 ```
 
-> **Uso ético únicamente.** Escaneá solo sistemas tuyos o con autorización
+> ⚠️ **Uso ético únicamente.** Escaneá solo sistemas tuyos o con autorización
 > explícita por escrito.
 
 ---
 
 ## Requisitos
 
-- Python 3.10 o superior
-- Nada más. Cero dependencias.
+- **Python 3.10 o superior** (nada más).
+
+No hay dependencias que instalar. En Linux/macOS suele venir ya instalado.
 
 ---
 
-## Instalación (para usar `netscope ip`)
-
-Hacé el script ejecutable y enlazalo en tu PATH (una sola vez):
+## Clonar y usar (2 pasos)
 
 ```bash
-chmod +x netscope.py
-mkdir -p ~/.local/bin
-ln -sf "$PWD/netscope.py" ~/.local/bin/netscope
+git clone https://github.com/tu-usuario/netscope.git
+cd netscope
+./netscope 192.168.1.10
 ```
 
-Listo. Ahora desde cualquier carpeta:
+Eso es todo. El script ya es ejecutable, no hace falta `pip` ni nada.
+
+### ¿Querés usar `netscope <ip>` sin el `./` desde cualquier carpeta?
+
+Corré el instalador incluido (crea un enlace en tu PATH, no copia archivos):
 
 ```bash
+./install.sh
 netscope 192.168.1.10
 ```
 
-Si preferís no instalarlo:
+### En Windows
 
-```bash
-python3 netscope.py 192.168.1.10
+```powershell
+python netscope 192.168.1.10
 ```
 
 ---
@@ -56,24 +60,18 @@ netscope <objetivo> [opciones]
 | `-p, --ports` | Puertos a escanear: `22,80,443` o `1-1000` |
 | `--full` | Escanear los 65535 puertos TCP |
 | `--top N` | Usar los N puertos más comunes (default: los 85 más habituales) |
-| `-t, --timeout` | Timeout por puerto en segundos (default: `0.7`) |
-| `-T, --threads` | Conexiones simultáneas (default: `1000`) |
-| `--no-banner` | No intentar leer banners/versiones |
+| `-t, --timeout` | Timeout por puerto en segundos (default `0.7`) |
+| `-T, --threads` | Conexiones simultáneas (default `1000`) |
+| `--no-banner` | No intentar leer banners/versiones (más rápido) |
 
 ### Ejemplos
 
 ```bash
-# Puertos comunes + servicio/versión (por defecto)
-netscope 192.168.1.10
-
-# Rango concreto
-netscope 192.168.1.10 -p 1-1024
-
-# Todos los puertos (rápido: ~10s en localhost)
-netscope 192.168.1.10 --full
-
-# Por hostname
-netscope scanme.nmap.org
+netscope 192.168.1.10                 # puertos comunes + servicio/versión
+netscope 192.168.1.10 -p 1-1024       # un rango
+netscope 192.168.1.10 --full          # los 65535 puertos (~10s en localhost)
+netscope scanme.nmap.org              # por hostname
+netscope 192.168.1.10 --no-banner     # más rápido, sin versiones
 ```
 
 ### Salida
@@ -96,19 +94,19 @@ netscope scanme.nmap.org
 
 ## Qué detecta
 
-- **Puertos abiertos** vía TCP connect scan asíncrono (no necesita root).
+- **Puertos abiertos** (TCP connect scan asíncrono, no necesita root).
 - **Servicio** por número de puerto (ssh, http, smb, redis, mongodb…).
 - **Versión/banner** del servicio.
-- **Riesgos obvios** en puertos peligrosos (Telnet, SMB, RDP, Redis, MongoDB,
-  Docker API, Memcached, Elasticsearch…).
+- **Riesgos obvios**: Telnet, SMB, RDP, Redis, MongoDB, Docker API, Memcached,
+  Elasticsearch, FTP, MySQL, PostgreSQL…
 
 ---
 
 ## Cómo funciona
 
-Usa `asyncio`: mantiene cientos o miles de conexiones TCP en vuelo a la vez, por
-eso es rápido. Es un *TCP connect scan* completo (no raw sockets), así que no
-requiere permisos de administrador.
+Usa `asyncio` de Python: mantiene miles de conexiones TCP en vuelo a la vez, por
+eso escanea en segundos. Es un *TCP connect scan* completo, así que funciona sin
+permisos de administrador.
 
 ---
 
