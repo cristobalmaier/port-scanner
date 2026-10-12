@@ -1,13 +1,24 @@
 # netscope
 
-Escáner de puertos **rápido y sencillo** en un solo archivo, sin dependencias
-(solo la librería estándar de Python 3.10+). Alternativa ligera a nmap para
-reconocimiento rápido: te dice qué puertos están abiertos, qué servicio corre y
-su versión, y marca los riesgos obvios.
+Recon rápido de puertos **en un solo comando**, sin dependencias (solo la
+librería estándar de Python 3.10+).
+
+Reemplaza tu flujo de dos pasos de nmap:
 
 ```bash
-netscope 192.168.1.10
+sudo nmap -p- --open -sS --min-rate 5000 -n -Pn -vv <IP> -oG allPorts
+nmap -sCV -p<PUERTOS> <IP> -oN targeted
 ```
+
+por uno solo:
+
+```bash
+netscope <IP>
+```
+
+Hace las dos fases de golpe —**descubrir todos los puertos** y **detectar
+servicio/versión** de los abiertos—, te muestra una tabla fácil de leer y te
+guarda los resultados para seguir con la auditoría.
 
 > ⚠️ **Uso ético únicamente.** Escaneá solo sistemas tuyos o con autorización
 > explícita por escrito.
@@ -16,97 +27,116 @@ netscope 192.168.1.10
 
 ## Requisitos
 
-- **Python 3.10 o superior** (nada más).
-
-No hay dependencias que instalar. En Linux/macOS suele venir ya instalado.
+- **Python 3.10 o superior**. Nada más.
 
 ---
 
-## Clonar y usar (2 pasos)
+## Clonar y usar
 
 ```bash
 git clone https://github.com/tu-usuario/netscope.git
 cd netscope
-./netscope 192.168.1.10
+./netscope 10.10.10.10
 ```
 
-Eso es todo. El script ya es ejecutable, no hace falta `pip` ni nada.
+Ya está: el script es ejecutable, no hace falta `pip` ni permisos de root.
 
-### ¿Querés usar `netscope <ip>` sin el `./` desde cualquier carpeta?
-
-Corré el instalador incluido (crea un enlace en tu PATH, no copia archivos):
+¿Querés usar `netscope <ip>` desde cualquier carpeta? Corré el instalador:
 
 ```bash
 ./install.sh
-netscope 192.168.1.10
+netscope 10.10.10.10
 ```
 
-### En Windows
-
-```powershell
-python netscope 192.168.1.10
-```
+En Windows: `python netscope 10.10.10.10`
 
 ---
 
-## Uso
+## Cómo funciona (las 2 fases)
 
-```bash
-netscope <objetivo> [opciones]
-```
+1. **Fase 1 — Descubrimiento.** Escanea los 65535 puertos TCP en paralelo con
+   `asyncio` (equivalente a `nmap -p- --open --min-rate 5000`). No usa `ping`
+   previo y no hace resolución inversa (como `-Pn -n`).
+2. **Fase 2 — Servicio y versión.** Sobre los puertos abiertos pide el banner,
+   la versión y, en HTTP/HTTPS, el título de la página y el certificado TLS
+   (equivalente a `nmap -sCV`).
+
+Al terminar, guarda en una carpeta:
+
+- `allPorts.txt` — formato *grepable* (como `-oG allPorts`).
+- `targeted.txt` — informe legible con servicios, versiones y riesgos (como
+  `-oN targeted`).
+
+---
+
+## Opciones
 
 | Opción | Descripción |
 |--------|-------------|
-| `-p, --ports` | Puertos a escanear: `22,80,443` o `1-1000` |
-| `--full` | Escanear los 65535 puertos TCP |
-| `--top N` | Usar los N puertos más comunes (default: los 85 más habituales) |
+| `-p, --ports` | Puertos concretos: `22,80,443` o `1-1000` |
+| `--top N` | Solo los N puertos más comunes (más rápido) |
 | `-t, --timeout` | Timeout por puerto en segundos (default `0.7`) |
 | `-T, --threads` | Conexiones simultáneas (default `1000`) |
-| `--no-banner` | No intentar leer banners/versiones (más rápido) |
+| `--no-version` | Solo descubrir puertos (saltar fase 2) |
+| `-o, --output` | Carpeta de salida (default `netscope_<IP>/`) |
+| `-q, --quiet` | Sin salida de progreso |
 
 ### Ejemplos
 
 ```bash
-netscope 192.168.1.10                 # puertos comunes + servicio/versión
-netscope 192.168.1.10 -p 1-1024       # un rango
-netscope 192.168.1.10 --full          # los 65535 puertos (~10s en localhost)
-netscope scanme.nmap.org              # por hostname
-netscope 192.168.1.10 --no-banner     # más rápido, sin versiones
+netscope 10.10.10.10                 # escaneo completo (recomendado)
+netscope 10.10.10.10 --top 1000      # solo los 1000 más comunes
+netscope 10.10.10.10 -p 22,80,443    # puertos concretos
+netscope 10.10.10.10 -o audit/       # elegir carpeta de salida
+netscope scanme.nmap.org             # host público de práctica (legal)
 ```
 
-### Salida
+---
+
+## Salida
 
 ```
-  netscope — objetivo scanme.nmap.org (45.33.32.156)
-  Escaneando 85 puertos TCP...
+  netscope — 10.10.10.10 (10.10.10.10)
+  Fase 1/2 · descubriendo puertos abiertos (65535)...
 
-  PUERTO      ESTADO  SERVICIO      VERSION
-  ────────────────────────────────────────────────────────────
-  22/tcp      open    ssh           SSH-2.0-OpenSSH_6.6.1p1 Ubuntu-2ubuntu2.13
-  80/tcp      open    http          HTTP/1.1 200 OK
-  3389/tcp    open    rdp
-       [HIGH] RDP expuesto a fuerza bruta / BlueKeep
+  22/tcp open  (ssh)
+  80/tcp open  (http)
+  3306/tcp open  (mysql)
 
-  Listo: 3 abiertos / 85 escaneados en 1.44s
+  [+] Abiertos: 22, 80, 3306  (3 en 8.4s)
+
+  Fase 2/2 · detectando servicio/versión de 3 puertos...
+
+  PUERTO      SERVICIO        VERSIÓN
+  ──────────────────────────────────────────────────────────────
+  22/tcp      ssh             OpenSSH 8.2p1
+  80/tcp      http            Apache 2.4.7 — "Go ahead and ScanMe!"
+  3306/tcp    mysql           MySQL 5.7.42
+       [MEDIUM] MySQL expuesto en red
+
+  Listo: 3 puertos abiertos en 9.1s
+  Guardado en netscope_10_10_10_10/  (allPorts.txt, targeted.txt)
 ```
 
 ---
 
 ## Qué detecta
 
-- **Puertos abiertos** (TCP connect scan asíncrono, no necesita root).
-- **Servicio** por número de puerto (ssh, http, smb, redis, mongodb…).
-- **Versión/banner** del servicio.
-- **Riesgos obvios**: Telnet, SMB, RDP, Redis, MongoDB, Docker API, Memcached,
-  Elasticsearch, FTP, MySQL, PostgreSQL…
+- **Puertos abiertos** (TCP connect scan asíncrono, sin root).
+- **Servicio** por puerto y **versión/banner** del servicio.
+- **HTTP/HTTPS**: título de la página, cabecera `Server` y datos del
+  certificado TLS (versión, cifrado, CN, expiración).
+- **Avisos de riesgo** en puertos peligrosos: Telnet, SMB, RDP, Redis, MongoDB,
+  Docker API, Memcached, Elasticsearch, FTP, MySQL, PostgreSQL…
 
 ---
 
-## Cómo funciona
+## Notas
 
-Usa `asyncio` de Python: mantiene miles de conexiones TCP en vuelo a la vez, por
-eso escanea en segundos. Es un *TCP connect scan* completo, así que funciona sin
-permisos de administrador.
+- No necesita `sudo`: usa *TCP connect scan* (abre la conexión completa) en vez
+  de SYN scan con raw sockets.
+- Es más rápido en LAN que sobre Internet, donde los puertos **filtrados**
+  (firewalls que no responden) dependen del `--timeout`.
 
 ---
 

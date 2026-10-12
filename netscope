@@ -1,117 +1,338 @@
 #!/usr/bin/env python3
 """
-netscope — escáner de puertos rápido y sencillo (alternativa ligera a nmap).
+netscope — recon rápido en un solo comando.
 
-Uso:
-    python3 netscope.py <objetivo>
-    python3 netscope.py <objetivo> -p 1-65535
-    python3 netscope.py <objetivo> --full
-    python3 netscope.py <objetivo> -t 0.5 --top 500
+Reemplaza el flujo típico de dos pasos:
 
-Solo biblioteca estándar. Escaneá únicamente sistemas que te pertenezcan o
-para los que tengas autorización por escrito.
+    sudo nmap -p- --open -sS --min-rate 5000 -n -Pn -vv <IP> -oG allPorts
+    nmap -sCV -p<PUERTOS> <IP> -oN targeted
+
+con:
+
+    netscope <IP>
+
+Hace las dos fases (descubrir todos los puertos + detectar servicio/versión),
+te muestra una tabla fácil de leer y guarda los resultados en una carpeta para
+seguir con la auditoría.
+
+Solo biblioteca estándar (Python 3.10+). Escaneá únicamente sistemas que te
+pertenezcan o para los que tengas autorización por escrito.
 """
 
 import argparse
 import asyncio
+import os
+import re
 import socket
+import ssl
 import sys
+import tempfile
 import time
-
-# ── Puertos comunes (por defecto) ────────────────────────────────────────────
-COMMON_PORTS = [
-    20, 21, 22, 23, 25, 53, 67, 68, 69, 80, 110, 111, 123, 135, 137, 138, 139,
-    143, 161, 162, 179, 389, 443, 445, 465, 514, 515, 548, 554, 587, 631, 636,
-    873, 993, 995, 1025, 1080, 1099, 1433, 1434, 1521, 1723, 1883, 2049, 2181,
-    2375, 2376, 3000, 3128, 3260, 3306, 3389, 4369, 5000, 5060, 5432, 5555,
-    5601, 5672, 5900, 5984, 5985, 5986, 6379, 6443, 7001, 8000, 8008, 8009,
-    8080, 8081, 8086, 8443, 8888, 9000, 9042, 9090, 9092, 9200, 9300, 10000,
-    11211, 15672, 27017, 50000,
-]
+from concurrent.futures import ThreadPoolExecutor
 
 # ── Servicios conocidos ──────────────────────────────────────────────────────
 SERVICES = {
-    21: "ftp", 22: "ssh", 23: "telnet", 25: "smtp", 53: "dns", 80: "http",
-    110: "pop3", 111: "rpcbind", 123: "ntp", 135: "msrpc", 137: "netbios",
-    139: "netbios-ssn", 143: "imap", 161: "snmp", 389: "ldap", 443: "https",
-    445: "smb", 465: "smtps", 514: "rsh", 587: "smtp", 631: "ipp", 636: "ldaps",
-    873: "rsync", 993: "imaps", 995: "pop3s", 1433: "mssql", 1521: "oracle",
-    1723: "pptp", 2049: "nfs", 2181: "zookeeper", 2375: "docker", 2376: "docker-tls",
-    3000: "http-dev", 3306: "mysql", 3389: "rdp", 5432: "postgresql",
-    5601: "kibana", 5672: "amqp", 5900: "vnc", 5984: "couchdb", 6379: "redis",
-    6443: "kubernetes", 8000: "http-alt", 8008: "http-alt", 8080: "http-proxy",
-    8081: "http-alt", 8443: "https-alt", 8888: "http-alt", 9000: "http-alt",
-    9200: "elasticsearch", 9300: "elasticsearch", 10000: "webmin",
-    11211: "memcached", 15672: "rabbitmq", 27017: "mongodb", 50000: "sap",
+    20: "ftp-data", 21: "ftp", 22: "ssh", 23: "telnet", 25: "smtp", 53: "domain",
+    80: "http", 110: "pop3", 111: "rpcbind", 135: "msrpc", 139: "netbios-ssn",
+    143: "imap", 161: "snmp", 389: "ldap", 443: "https", 445: "microsoft-ds",
+    465: "smtps", 514: "rsh", 587: "smtp", 631: "ipp", 636: "ldaps", 873: "rsync",
+    993: "imaps", 995: "pop3s", 1433: "ms-sql", 1521: "oracle", 2049: "nfs",
+    2181: "zookeeper", 2375: "docker", 2379: "etcd", 3000: "http-alt",
+    3128: "squid", 3260: "iscsi", 3306: "mysql", 3389: "ms-wbt-server",
+    4369: "epmd", 5000: "http-alt", 5432: "postgresql", 5601: "kibana",
+    5672: "amqp", 5900: "vnc", 5984: "couchdb", 5985: "winrm", 6379: "redis",
+    6443: "kubernetes", 7001: "weblogic", 8000: "http-alt", 8008: "http-alt",
+    8009: "ajp13", 8080: "http-proxy", 8081: "http-alt", 8086: "influxdb",
+    8443: "https-alt", 8888: "http-alt", 9000: "http-alt", 9042: "cassandra",
+    9090: "http-alt", 9200: "elasticsearch", 9300: "elasticsearch",
+    10000: "webmin", 11211: "memcached", 15672: "rabbitmq-mgmt",
+    27017: "mongodb", 50000: "sap",
 }
 
-# ── Puertos con riesgo ───────────────────────────────────────────────────────
+# Puertos HTTP / HTTPS para pedir la página y sacar título/versión.
+HTTP_PORTS = {80, 81, 3000, 5000, 7001, 8000, 8008, 8080, 8081, 8086, 8161,
+              8888, 9000, 9090, 9200, 10000, 15672, 2375}
+HTTPS_PORTS = {443, 8443, 9443, 2376, 6443}
+
+# Riesgos conocidos por puerto (nivel, motivo).
 DANGEROUS = {
-    21: ("HIGH", "FTP sin cifrado; revisar login anónimo"),
-    23: ("CRITICAL", "Telnet transmite credenciales en texto plano"),
+    21: ("HIGH", "FTP sin cifrado; probar login anónimo"),
+    23: ("CRITICAL", "Telnet en texto plano"),
+    111: ("MEDIUM", "rpcbind: enumera RPC/NFS"),
     139: ("HIGH", "NetBIOS/SMB legado"),
-    445: ("CRITICAL", "SMB expuesto (EternalBlue / ransomware)"),
-    1433: ("MEDIUM", "MSSQL expuesto; revisar credenciales por defecto"),
-    2375: ("CRITICAL", "Docker API sin autenticación: control del host"),
+    445: ("CRITICAL", "SMB expuesto (EternalBlue/ransomware)"),
+    1433: ("MEDIUM", "MSSQL expuesto; probar credenciales por defecto"),
+    2375: ("CRITICAL", "Docker API sin auth: control del host"),
+    2379: ("HIGH", "etcd expuesto: posibles secretos"),
     3306: ("MEDIUM", "MySQL expuesto en red"),
-    3389: ("HIGH", "RDP expuesto a fuerza bruta / BlueKeep"),
+    3389: ("HIGH", "RDP: fuerza bruta / BlueKeep"),
     5432: ("MEDIUM", "PostgreSQL expuesto en red"),
-    5900: ("HIGH", "VNC con autenticación débil o nula"),
+    5900: ("HIGH", "VNC con auth débil o nula"),
     6379: ("CRITICAL", "Redis sin contraseña: RCE por escritura de ficheros"),
     9200: ("HIGH", "Elasticsearch sin autenticación"),
     11211: ("HIGH", "Memcached sin autenticación"),
     27017: ("CRITICAL", "MongoDB sin autenticación"),
 }
 
-HTTP_PORTS = {80, 3000, 5000, 8000, 8008, 8080, 8081, 8888, 9000, 9200, 15672, 2375}
-
-RESET, BOLD, GRAY = "\033[0m", "\033[1m", "\033[90m"
-RED, GREEN, YELLOW, CYAN, WHITE = "\033[91m", "\033[92m", "\033[93m", "\033[96m", "\033[97m"
-
-ISATTY = sys.stdout.isatty()
-
-
-def color(text, code):
-    return f"{code}{text}{RESET}" if ISATTY else text
-
-
-async def grab_banner(loop, sock, port, timeout):
-    """Lee el banner del servicio (envía una petición si hace falta)."""
-    try:
-        data = await asyncio.wait_for(loop.sock_recv(sock, 1024), min(timeout, 0.6))
-    except (asyncio.TimeoutError, OSError):
-        data = b""
-    if not data:
-        probe = b"GET / HTTP/1.0\r\nHost: x\r\n\r\n" if port in HTTP_PORTS else b"\r\n"
-        try:
-            await loop.sock_sendall(sock, probe)
-            data = await asyncio.wait_for(loop.sock_recv(sock, 1024), min(timeout, 0.8))
-        except (asyncio.TimeoutError, OSError):
-            return ""
-    if not data:
-        return ""
-    line = data.decode("utf-8", "ignore").replace("\r", "").split("\n")[0]
-    return line.strip()[:70]
+# ── Parser de versión a partir de banners ────────────────────────────────────
+_PATTERNS = [
+    re.compile(r"SSH-\d+\.\d+-(?P<product>[\w.\-]+?)[_/ ](?P<ver>[\w.]+)", re.I),
+    re.compile(r"(?P<product>vsFTPd|ProFTPD|Pure-FTPd)[ /](?P<ver>[\w.]+)", re.I),
+    re.compile(r"(?P<product>nginx)/(?P<ver>[\w.]+)", re.I),
+    re.compile(r"(?P<product>Apache)/(?P<ver>[\d.]+)", re.I),
+    re.compile(r"(?P<product>Microsoft-IIS)/(?P<ver>[\d.]+)", re.I),
+    re.compile(r"(?P<product>Postfix|Exim|Sendmail)[ /](?P<ver>[\w.\-]+)", re.I),
+    re.compile(r"redis_version:(?P<ver>[\w.\-]+)", re.I),
+    re.compile(r"(?P<product>MySQL|MariaDB)[ -]?(?P<ver>\d[\w.\-]*)", re.I),
+    re.compile(r"(?P<product>SimpleHTTP)/(?P<ver>[\w.]+)", re.I),
+]
 
 
-async def scan_port(ip, port, timeout, sem, banners):
+def parse_version(text):
+    for rx in _PATTERNS:
+        m = rx.search(text or "")
+        if m:
+            g = m.groupdict()
+            return (g.get("product") or "").strip(), (g.get("ver") or "").strip()
+    return "", ""
+
+
+def first_line(data):
+    return data.decode("utf-8", "ignore").replace("\r", "").split("\n")[0].strip()
+
+
+# ── Fase 1: descubrimiento de puertos (asíncrono, rápido) ────────────────────
+async def _probe(ip, port, timeout, sem):
     async with sem:
         loop = asyncio.get_running_loop()
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.setblocking(False)
         try:
             await asyncio.wait_for(loop.sock_connect(sock, (ip, port)), timeout)
+            return port
         except (asyncio.TimeoutError, OSError):
-            sock.close()
             return None
-        banner = await grab_banner(loop, sock, port, timeout) if banners else ""
-        sock.close()
-        return port, banner
+        finally:
+            sock.close()
+
+
+async def discover(ip, ports, timeout, threads, verbose):
+    sem = asyncio.Semaphore(threads)
+    open_ports = []
+    tasks = [_probe(ip, p, timeout, sem) for p in ports]
+    for coro in asyncio.as_completed(tasks):
+        port = await coro
+        if port is not None:
+            open_ports.append(port)
+            if verbose:
+                print(f"  {port}/tcp open  ({SERVICES.get(port, 'unknown')})")
+    return sorted(open_ports)
+
+
+# ── Fase 2: detección de servicio/versión (hilos, bloqueante) ────────────────
+def _connect(ip, port, timeout, tls=False):
+    sock = socket.create_connection((ip, port), timeout=timeout)
+    sock.settimeout(timeout)
+    if tls:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        try:
+            ctx.set_alpn_protocols(["http/1.1"])
+        except NotImplementedError:
+            pass
+        sock = ctx.wrap_socket(sock, server_hostname=ip)
+    return sock
+
+
+def _recv(sock, timeout):
+    sock.settimeout(timeout)
+    data = b""
+    while len(data) < 8192:
+        try:
+            chunk = sock.recv(4096)
+        except (socket.timeout, TimeoutError, OSError):
+            break
+        if not chunk:
+            break
+        data += chunk
+        if len(data) >= 1024:
+            break
+    return data
+
+
+def _tls_info(sock):
+    try:
+        version = sock.version()
+        cipher = (sock.cipher() or ("",))[0]
+        der = sock.getpeercert(binary_form=True)
+    except Exception:
+        return ""
+    info = f"{version} · {cipher}"
+    if der:
+        try:
+            with tempfile.NamedTemporaryFile("w", suffix=".pem", delete=False) as fh:
+                fh.write(ssl.DER_cert_to_PEM_cert(der))
+                path = fh.name
+            cert = ssl._ssl._test_decode_cert(path)  # type: ignore[attr-defined]
+            os.unlink(path)
+            cn = ""
+            for rdn in cert.get("subject", ()):
+                for k, v in rdn:
+                    if k == "commonName":
+                        cn = v
+            if cn:
+                info += f" · CN={cn}"
+            if cert.get("notAfter"):
+                info += f" · expira {cert['notAfter']}"
+        except Exception:
+            pass
+    return info
+
+
+def enrich(ip, port, timeout):
+    service = SERVICES.get(port, "unknown")
+    product = version = banner = tls = ""
+    http = {}
+
+    if port in HTTPS_PORTS:
+        try:
+            sock = _connect(ip, port, timeout, tls=True)
+            tls = _tls_info(sock)
+            if port in HTTPS_PORTS:
+                sock.sendall(b"GET / HTTP/1.0\r\nHost: " + ip.encode() + b"\r\n\r\n")
+                text = _recv(sock, 0.8).decode("utf-8", "ignore")
+                http = _parse_http(text)
+            sock.close()
+        except Exception:
+            pass
+    else:
+        try:
+            sock = _connect(ip, port, timeout)
+            raw = _recv(sock, 0.6)
+            if not raw:
+                probe = b"GET / HTTP/1.0\r\n\r\n" if port in HTTP_PORTS else b"\r\n"
+                sock.sendall(probe)
+                raw = _recv(sock, 0.8)
+            sock.close()
+            banner = first_line(raw)[:90]
+            if port in HTTP_PORTS:
+                http = _parse_http(raw.decode("utf-8", "ignore"))
+        except Exception:
+            pass
+
+    source = http.get("server", "") or banner
+    product, version = parse_version(source)
+    if not product:
+        product, version = parse_version(banner)
+
+    return {"port": port, "service": service, "product": product,
+            "version": version, "banner": banner, "tls": tls, "http": http}
+
+
+def _parse_http(text):
+    out = {}
+    m = re.search(r"^HTTP/[\d.]+ (\d{3})", text or "", re.M)
+    if m:
+        out["status"] = int(m.group(1))
+    m = re.search(r"^Server:\s*(.+)$", text or "", re.M | re.I)
+    if m:
+        out["server"] = m.group(1).strip()
+    m = re.search(r"<title[^>]*>(.*?)</title>", text or "", re.I | re.S)
+    if m:
+        out["title"] = re.sub(r"\s+", " ", m.group(1)).strip()[:90]
+    return out
+
+
+# ── Salida ───────────────────────────────────────────────────────────────────
+RESET, BOLD, GRAY = "\033[0m", "\033[1m", "\033[90m"
+RED, GREEN, YELLOW, CYAN, WHITE = "\033[91m", "\033[92m", "\033[93m", "\033[96m", "\033[97m"
+
+
+def color(text, code):
+    return f"{code}{text}{RESET}" if sys.stdout.isatty() else text
+
+
+def version_string(item):
+    v = " ".join(x for x in (item["product"], item["version"]) if x).strip()
+    if item["http"].get("title"):
+        v = (v + f' — "{item["http"]["title"]}"').strip()
+    elif item["tls"]:
+        v = (v + f" — {item['tls']}").strip()
+    return v
+
+
+def print_table(results):
+    print(color(f"  {'PUERTO':<12}{'SERVICIO':<16}VERSIÓN", GRAY))
+    print(color("  " + "─" * 62, GRAY))
+    for item in results:
+        label = f"{item['port']}/tcp"
+        service = f"{item['service']:<16}"
+        row = (f"  {color(f'{label:<12}', BOLD + WHITE)}"
+               f"{color(service, CYAN)}"
+               f"{color(version_string(item), GRAY)}")
+        print(row)
+        if item["port"] in DANGEROUS:
+            level, reason = DANGEROUS[item["port"]]
+            col = RED if level == "CRITICAL" else YELLOW
+            print(f"       {color('[' + level + ']', BOLD + col)} {reason}")
+
+
+def grepable(ip, results):
+    parts = []
+    for item in results:
+        ver = " ".join(x for x in (item["product"], item["version"]) if x)
+        parts.append(f"{item['port']}/open/tcp//{item['service']}//{ver}/")
+    return f"Host: {ip} ()\tPorts: {', '.join(parts)}"
+
+
+def targeted_report(target, ip, results, elapsed):
+    lines = [f"# netscope report — {target} ({ip})",
+             f"# {len(results)} puertos abiertos · {elapsed:.1f}s", ""]
+    for item in results:
+        ver = version_string(item)
+        lines.append(f"{item['port']}/tcp  open  {item['service']:<16} {ver}".rstrip())
+        if item["banner"] and not item["http"].get("title"):
+            lines.append(f"    banner: {item['banner']}")
+        if item["port"] in DANGEROUS:
+            level, reason = DANGEROUS[item["port"]]
+            lines.append(f"    [{level}] {reason}")
+    return "\n".join(lines) + "\n"
+
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog="netscope",
+        description="Recon rápido en un comando: todos los puertos + servicios/versiones.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""ejemplos:
+  netscope 10.10.10.10                 escaneo completo (recomendado)
+  netscope 10.10.10.10 --top 1000      solo los 1000 puertos más comunes
+  netscope 10.10.10.10 -p 22,80,443    puertos concretos
+  netscope 10.10.10.10 -o audit/       elegir carpeta de salida
+""")
+    p.add_argument("target", help="IP o hostname")
+    p.add_argument("-p", "--ports", help="puertos: '22,80,443' o '1-1000'")
+    p.add_argument("--top", type=int, default=0,
+                   help="escanear solo los N puertos más comunes")
+    p.add_argument("-t", "--timeout", type=float, default=0.7,
+                   help="timeout por puerto (default 0.7)")
+    p.add_argument("-T", "--threads", type=int, default=1000,
+                   help="conexiones simultáneas (default 1000)")
+    p.add_argument("--no-version", action="store_true",
+                   help="solo descubrir puertos (saltar fase 2)")
+    p.add_argument("-o", "--output", help="carpeta de salida")
+    p.add_argument("-q", "--quiet", action="store_true", help="sin progreso")
+    return p
+
+
+COMMON = [21, 22, 23, 25, 53, 80, 110, 111, 135, 139, 143, 161, 389, 443, 445,
+          465, 587, 631, 636, 873, 993, 995, 1433, 1521, 2049, 2181, 2375, 3000,
+          3306, 3389, 5432, 5601, 5672, 5900, 5984, 6379, 6443, 8000, 8008,
+          8080, 8081, 8443, 8888, 9000, 9090, 9200, 10000, 11211, 27017]
 
 
 def parse_ports(args):
-    if args.full:
-        return list(range(1, 65536))
     if args.ports:
         ports = set()
         for chunk in args.ports.split(","):
@@ -122,75 +343,68 @@ def parse_ports(args):
             elif chunk:
                 ports.add(int(chunk))
         return sorted(p for p in ports if 1 <= p <= 65535)
-    return sorted(set(COMMON_PORTS))[: args.top]
-
-
-async def run(ip, ports, args):
-    sem = asyncio.Semaphore(args.threads)
-    start = time.time()
-    found = []
-    tasks = [scan_port(ip, p, args.timeout, sem, not args.no_banner) for p in ports]
-    for coro in asyncio.as_completed(tasks):
-        result = await coro
-        if result:
-            found.append(result)
-    found.sort()
-    return found, time.time() - start
+    if args.top > 0:
+        return COMMON[: args.top]
+    return list(range(1, 65536))
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Escáner de puertos rápido y sencillo (alternativa ligera a nmap).")
-    parser.add_argument("target", help="IP o hostname objetivo")
-    parser.add_argument("-p", "--ports", help="puertos: '22,80,443' o '1-1000'")
-    parser.add_argument("--full", action="store_true", help="escanear los 65535 puertos")
-    parser.add_argument("--top", type=int, default=len(COMMON_PORTS),
-                        help="usar los N puertos más comunes (default: %(default)s)")
-    parser.add_argument("-t", "--timeout", type=float, default=0.7,
-                        help="timeout por puerto en segundos (default: 0.7)")
-    parser.add_argument("-T", "--threads", type=int, default=1000,
-                        help="conexiones simultáneas (default: 1000)")
-    parser.add_argument("--no-banner", action="store_true",
-                        help="no intentar leer banners/versiones")
-    args = parser.parse_args()
+    args = build_parser().parse_args()
 
     try:
         ip = socket.gethostbyname(args.target)
     except socket.gaierror:
-        print(f"{color('[!] No se pudo resolver:', RED)} {args.target}")
+        print(color("[!] No se pudo resolver: ", RED) + args.target)
         return 1
 
     ports = parse_ports(args)
-    print(color(f"\n  netscope — objetivo {args.target} ({ip})", BOLD + CYAN))
-    print(color(f"  Escaneando {len(ports)} puertos TCP...\n", GRAY))
+    verbose = not args.quiet and sys.stdout.isatty()
+    print(color(f"\n  netscope — {args.target} ({ip})", BOLD + CYAN))
+    print(color(f"  Fase 1/2 · descubriendo puertos abiertos ({len(ports)})...\n", GRAY))
 
+    start = time.time()
     try:
-        found, elapsed = asyncio.run(run(ip, ports, args))
+        open_ports = asyncio.run(discover(ip, ports, args.timeout, args.threads, verbose))
     except KeyboardInterrupt:
         print("\n  Interrumpido.")
         return 130
+    elapsed1 = time.time() - start
 
-    if not found:
+    if not open_ports:
         print(color("  No se encontraron puertos abiertos.", YELLOW))
-    else:
-        print(color(f"  {'PUERTO':<12}{'ESTADO':<8}{'SERVICIO':<14}VERSION", GRAY))
-        print(color("  " + "─" * 60, GRAY))
-        for port, banner in found:
-            service = SERVICES.get(port, "unknown")
-            label = f"{port}/tcp"
-            version = banner or ""
-            row = (f"  {color(f'{label:<12}', BOLD + WHITE)}"
-                   f"{color(f'{"open":<8}', GREEN)}"
-                   f"{color(f'{service:<14}', CYAN)}"
-                   f"{color(version, GRAY)}")
-            print(row)
-            if port in DANGEROUS:
-                level, reason = DANGEROUS[port]
-                col = RED if level == "CRITICAL" else YELLOW
-                print(f"       {color(f'[{level}]', BOLD + col)} {reason}")
+        return 0
+    print(color(f"\n  [+] Abiertos: {', '.join(map(str, open_ports))}  "
+                f"({len(open_ports)} en {elapsed1:.1f}s)\n", GREEN))
 
-    print(color(f"\n  Listo: {len(found)} abiertos / {len(ports)} escaneados en {elapsed:.2f}s\n",
-                GRAY))
+    if args.no_version:
+        return 0
+
+    print(color(f"  Fase 2/2 · detectando servicio/versión de {len(open_ports)} puertos...\n", GRAY))
+    results = []
+    with ThreadPoolExecutor(max_workers=min(32, len(open_ports))) as pool:
+        for item in pool.map(lambda p: enrich(ip, p, args.timeout), open_ports):
+            results.append(item)
+    results.sort(key=lambda r: r["port"])
+
+    print_table(results)
+
+    total = time.time() - start
+    print(color(f"\n  Listo: {len(results)} puertos abiertos en {total:.1f}s", GREEN))
+
+    out_dir = args.output
+    if out_dir is None:
+        dirname = ip.replace(".", "_")
+        out_dir = os.path.join(os.getcwd(), f"netscope_{dirname}")
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+        with open(os.path.join(out_dir, "allPorts.txt"), "w", encoding="utf-8") as fh:
+            fh.write(grepable(ip, results) + "\n")
+        with open(os.path.join(out_dir, "targeted.txt"), "w", encoding="utf-8") as fh:
+            fh.write(targeted_report(args.target, ip, results, total))
+        print(color(f"  Guardado en {out_dir}/  (allPorts.txt, targeted.txt)\n", GRAY))
+    except OSError as exc:
+        print(color(f"  [!] No se pudieron guardar los informes: {exc}\n", YELLOW))
+
     return 0
 
 
