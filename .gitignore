@@ -25,6 +25,9 @@ htmlcov/
 *.grep
 reports/
 netscope-*.json
+netscope_*/
+allPorts*
+targeted*
 
 # Editors / OS
 .vscode/
