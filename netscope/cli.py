@@ -119,7 +119,7 @@ def _make_progress(enabled: bool):
             return
         pct = int(done * 100 / total)
         bar = "#" * (pct // 4) + "-" * (25 - pct // 4)
-        target = host.hostname or host.ip
+        target = str(host)[:20]
         sys.stderr.write(f"\r  [{bar}] {pct:3d}%  {target:<20}")
         sys.stderr.flush()
         if done >= total:
