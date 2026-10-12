@@ -12,8 +12,8 @@ con:
     netscope <IP>
 
 Hace las dos fases (descubrir todos los puertos + detectar servicio/versión),
-te muestra una tabla fácil de leer y guarda los resultados en una carpeta para
-seguir con la auditoría.
+confirma vulnerabilidades típicas (FTP anónimo, Redis/VNC sin auth, …) y te
+sugiere los próximos comandos para seguir la auditoría.
 
 Solo biblioteca estándar (Python 3.10+). Escaneá únicamente sistemas que te
 pertenezcan o para los que tengas autorización por escrito.
@@ -25,6 +25,7 @@ import os
 import re
 import socket
 import ssl
+import struct
 import sys
 import tempfile
 import time
@@ -226,22 +227,193 @@ def enrich(ip, port, timeout):
     if not product:
         product, version = parse_version(banner)
 
-    return {"port": port, "service": service, "product": product,
+    item = {"port": port, "service": service, "product": product,
             "version": version, "banner": banner, "tls": tls, "http": http}
+    item["checks"] = active_checks(ip, port, timeout, item)
+    return item
 
 
 def _parse_http(text):
-    out = {}
-    m = re.search(r"^HTTP/[\d.]+ (\d{3})", text or "", re.M)
+    out = {"headers": {}}
+    text = text or ""
+    head = re.split(r"\r?\n\r?\n", text, maxsplit=1)[0]
+    m = re.search(r"^HTTP/[\d.]+ (\d{3})", head, re.M)
     if m:
         out["status"] = int(m.group(1))
-    m = re.search(r"^Server:\s*(.+)$", text or "", re.M | re.I)
-    if m:
-        out["server"] = m.group(1).strip()
-    m = re.search(r"<title[^>]*>(.*?)</title>", text or "", re.I | re.S)
+    for name, value in re.findall(r"^([A-Za-z0-9\-]+):\s*(.*)$", head, re.M):
+        out["headers"].setdefault(name.lower(), value.strip())
+    if out["headers"].get("server"):
+        out["server"] = out["headers"]["server"]
+    m = re.search(r"<title[^>]*>(.*?)</title>", text, re.I | re.S)
     if m:
         out["title"] = re.sub(r"\s+", " ", m.group(1)).strip()[:90]
     return out
+
+
+# ── Fase 3: chequeos activos (confirman vulns típicas) ───────────────────────
+def _http_get(ip, port, timeout, tls=False, path="/"):
+    sock = _connect(ip, port, timeout, tls=tls)
+    req = (f"GET {path} HTTP/1.0\r\nHost: {ip}\r\n"
+           f"User-Agent: netscope\r\nConnection: close\r\n\r\n")
+    sock.sendall(req.encode())
+    data = _recv(sock, 1.0)
+    sock.close()
+    return data.decode("utf-8", "ignore")
+
+
+def _check_ftp(ip, timeout):
+    sock = _connect(ip, 21, timeout)
+    _recv(sock, 0.6)
+    sock.sendall(b"USER anonymous\r\n")
+    r1 = _recv(sock, 0.6).decode("utf-8", "ignore")
+    sock.sendall(b"PASS anonymous@example.com\r\n")
+    r2 = _recv(sock, 0.6).decode("utf-8", "ignore")
+    sock.sendall(b"QUIT\r\n")
+    sock.close()
+    if "230" in r2:
+        return "FTP permite login ANÓNIMO (sin credenciales)"
+    if "331" in r1:
+        return "FTP pide contraseña (probá anonymous)"
+    return None
+
+
+def _check_redis(ip, timeout):
+    sock = _connect(ip, 6379, timeout)
+    sock.sendall(b"PING\r\n")
+    r = _recv(sock, 0.6).decode("utf-8", "ignore")
+    sock.close()
+    if "+PONG" in r:
+        return "Redis SIN contraseña (responde PING)"
+    if "NOAUTH" in r or "AUTH" in r:
+        return "Redis requiere contraseña"
+    return None
+
+
+def _check_vnc(ip, timeout):
+    sock = _connect(ip, 5900, timeout)
+    ver = _recv(sock, 0.6)
+    if not ver.startswith(b"RFB"):
+        sock.close()
+        return None
+    sock.sendall(ver)
+    data = _recv(sock, 0.6)
+    sock.close()
+    if len(data) >= 2 and data[1] == 1:
+        return "VNC SIN autenticación"
+    if data and data[0] >= 1:
+        return "VNC pide contraseña"
+    return None
+
+
+def _check_elasticsearch(ip, timeout):
+    text = _http_get(ip, 9200, timeout)
+    if "You Know, for Search" in text or '"cluster_name"' in text:
+        return "Elasticsearch accesible SIN autenticación"
+    if text.split("\n", 1)[0].endswith("401 Unauthorized"):
+        return "Elasticsearch requiere autenticación"
+    return None
+
+
+def _check_docker(ip, timeout):
+    text = _http_get(ip, 2375, timeout)
+    if '"ApiVersion"' in text or '"Version"' in text:
+        return "Docker API EXPUESTA sin auth (control del host)"
+    return None
+
+
+def _bson_doc(fields):
+    body = b""
+    for name, value in fields:
+        body += b"\x10" + name.encode() + b"\x00" + struct.pack("<i", value)
+    body += b"\x00"
+    return struct.pack("<i", len(body) + 4) + body
+
+
+def _mongo_query(ip, timeout, db, fields):
+    payload = db.encode() + b".$cmd\x00"
+    payload += struct.pack("<i", 0)      # numberToSkip
+    payload += struct.pack("<i", -1)     # numberToReturn
+    payload += _bson_doc(fields)
+    header = struct.pack("<iiii", 16 + len(payload), 1, 0, 2004)  # OP_QUERY
+    sock = _connect(ip, 27017, timeout)
+    sock.sendall(header + payload)
+    data = b""
+    while len(data) < 16:
+        chunk = sock.recv(16 - len(data))
+        if not chunk:
+            break
+        data += chunk
+    if len(data) < 16:
+        sock.close()
+        return None
+    length = struct.unpack("<i", data[0:4])[0]
+    while len(data) < length:
+        chunk = sock.recv(length - len(data))
+        if not chunk:
+            break
+        data += chunk
+    sock.close()
+    return data.decode("latin-1", "ignore")
+
+
+def _check_mongo(ip, timeout):
+    body = _mongo_query(ip, timeout, "admin", [("listDatabases", 1)])
+    if not body:
+        return None
+    if "databases" in body:
+        return "MongoDB SIN autenticación (listDatabases accesible)"
+    if "unauthorized" in body.lower():
+        return "MongoDB requiere autenticación"
+    return None
+
+
+SECURITY_HEADERS = {
+    "content-security-policy": "CSP",
+    "x-frame-options": "X-Frame-Options",
+    "x-content-type-options": "X-Content-Type-Options",
+}
+
+
+def _check_headers(item):
+    headers = (item.get("http") or {}).get("headers")
+    if not headers:
+        return None
+    want = dict(SECURITY_HEADERS)
+    if item["port"] in HTTPS_PORTS:
+        want["strict-transport-security"] = "HSTS"
+    missing = [label for key, label in want.items() if key not in headers]
+    if missing:
+        return "Faltan cabeceras de seguridad: " + ", ".join(missing)
+    return None
+
+
+CHECKERS = {
+    21: _check_ftp,
+    2375: _check_docker,
+    5900: _check_vnc,
+    6379: _check_redis,
+    9200: _check_elasticsearch,
+    27017: _check_mongo,
+}
+
+
+def active_checks(ip, port, timeout, item):
+    findings = []
+    checker = CHECKERS.get(port)
+    if checker:
+        try:
+            finding = checker(ip, timeout)
+            if finding:
+                findings.append(finding)
+        except Exception:
+            pass
+    try:
+        finding = _check_headers(item)
+        if finding:
+            findings.append(finding)
+    except Exception:
+        pass
+    return findings
 
 
 # ── Salida ───────────────────────────────────────────────────────────────────
@@ -275,32 +447,81 @@ def print_table(results):
                f"{color(service, CYAN)}"
                f"{color(version_string(item), GRAY)}")
         print(row)
-        if item["port"] in DANGEROUS:
+        findings = item.get("checks", [])
+        if item["port"] in DANGEROUS and not findings:
             level, reason = DANGEROUS[item["port"]]
             col = RED if level == "CRITICAL" else YELLOW
             print(f"       {color('[' + level + ']', BOLD + col)} {reason}")
+        for finding in findings:
+            print(f"       {color('[!]', BOLD + YELLOW)} {color(finding, YELLOW)}")
 
 
-def grepable(ip, results):
-    parts = []
+WEB_PORTS = {80, 81, 3000, 5000, 7001, 8000, 8008, 8080, 8081, 8443, 8888,
+             9000, 9090, 10000, 443, 9443}
+
+# Comandos sugeridos para seguir la auditoría en cada servicio.
+NEXT_STEPS = {
+    21: ["ftp anonymous@{ip}",
+         "hydra -l anonymous -P /usr/share/wordlists/rockyou.txt ftp://{ip}"],
+    22: ["ssh <usuario>@{ip}", "searchsploit OpenSSH"],
+    23: ["telnet {ip}"],
+    25: ["smtp-user-enum -M VRFY -U /usr/share/seclists/Usernames/top-usernames-shortlist.txt -t {ip}"],
+    53: ["dig axfr @{ip} <dominio>"],
+    111: ["rpcinfo -p {ip}", "showmount -e {ip}"],
+    139: ["enum4linux -a {ip}", "nbtscan {ip}"],
+    389: ["ldapsearch -x -H ldap://{ip} -s base"],
+    445: ["enum4linux -a {ip}", "smbclient -L //{ip}/ -N", "smbmap -H {ip}"],
+    873: ["rsync rsync://{ip}/"],
+    1433: ["impacket-mssqlclient sa@{ip}"],
+    2049: ["showmount -e {ip}"],
+    3306: ["mysql -h {ip} -u root -p"],
+    3389: ["xfreerdp /v:{ip} /cert:ignore"],
+    5432: ["psql -h {ip} -U postgres"],
+    5900: ["vncviewer {ip}"],
+    5985: ["evil-winrm -i {ip} -u <usuario> -p <pass>"],
+    6379: ["redis-cli -h {ip}"],
+    9200: ["curl http://{ip}:9200/_cat/indices?v"],
+    11211: ["echo stats | nc {ip} 11211"],
+    2375: ["docker -H tcp://{ip}:2375 ps"],
+    27017: ["mongosh {ip} --eval \"db.adminCommand('listDatabases')\""],
+}
+
+
+def next_steps(ip, results):
+    steps = []
+    seen = set()
     for item in results:
-        ver = " ".join(x for x in (item["product"], item["version"]) if x)
-        parts.append(f"{item['port']}/open/tcp//{item['service']}//{ver}/")
-    return f"Host: {ip} ()\tPorts: {', '.join(parts)}"
+        port = item["port"]
+        cmds = []
+        if port in WEB_PORTS:
+            scheme = "https" if port in HTTPS_PORTS else "http"
+            url = f"{scheme}://{ip}" if port in (80, 443) else f"{scheme}://{ip}:{port}"
+            cmds += [f"whatweb {url}",
+                     f"gobuster dir -u {url} -w /usr/share/wordlists/dirb/common.txt",
+                     f"nikto -h {url}"]
+        cmds += NEXT_STEPS.get(port, [])
+        unique = []
+        for cmd in cmds:
+            cmd = cmd.format(ip=ip)
+            if cmd not in seen:
+                seen.add(cmd)
+                unique.append(cmd)
+        if unique:
+            steps.append((port, unique))
+    return steps
 
 
-def targeted_report(target, ip, results, elapsed):
-    lines = [f"# netscope report — {target} ({ip})",
-             f"# {len(results)} puertos abiertos · {elapsed:.1f}s", ""]
-    for item in results:
-        ver = version_string(item)
-        lines.append(f"{item['port']}/tcp  open  {item['service']:<16} {ver}".rstrip())
-        if item["banner"] and not item["http"].get("title"):
-            lines.append(f"    banner: {item['banner']}")
-        if item["port"] in DANGEROUS:
-            level, reason = DANGEROUS[item["port"]]
-            lines.append(f"    [{level}] {reason}")
-    return "\n".join(lines) + "\n"
+def print_next_steps(ip, results):
+    steps = next_steps(ip, results)
+    if not steps:
+        return
+    print(color("\n  Próximos pasos sugeridos", BOLD + CYAN))
+    print(color("  " + "─" * 62, GRAY))
+    for port, cmds in steps:
+        service = SERVICES.get(port, "unknown")
+        print(color(f"  {port}/tcp  {service}", BOLD + WHITE))
+        for cmd in cmds:
+            print(f"      {color('$', GREEN)} {cmd}")
 
 
 def build_parser():
@@ -312,7 +533,6 @@ def build_parser():
   netscope 10.10.10.10                 escaneo completo (recomendado)
   netscope 10.10.10.10 --top 1000      solo los 1000 puertos más comunes
   netscope 10.10.10.10 -p 22,80,443    puertos concretos
-  netscope 10.10.10.10 -o audit/       elegir carpeta de salida
 """)
     p.add_argument("target", help="IP o hostname")
     p.add_argument("-p", "--ports", help="puertos: '22,80,443' o '1-1000'")
@@ -323,8 +543,7 @@ def build_parser():
     p.add_argument("-T", "--threads", type=int, default=1000,
                    help="conexiones simultáneas (default 1000)")
     p.add_argument("--no-version", action="store_true",
-                   help="solo descubrir puertos (saltar fase 2)")
-    p.add_argument("-o", "--output", help="carpeta de salida")
+                   help="solo descubrir puertos (saltar fases 2 y 3)")
     p.add_argument("-q", "--quiet", action="store_true", help="sin progreso")
     return p
 
@@ -382,7 +601,7 @@ def main():
     if args.no_version:
         return 0
 
-    print(color(f"  Fase 2/2 · detectando servicio/versión de {len(open_ports)} puertos...\n", GRAY))
+    print(color(f"  Fase 2/2 · servicio/versión + chequeos activos de {len(open_ports)} puertos...\n", GRAY))
     results = []
     with ThreadPoolExecutor(max_workers=min(32, len(open_ports))) as pool:
         for item in pool.map(lambda p: enrich(ip, p, args.timeout), open_ports):
@@ -394,19 +613,7 @@ def main():
     total = time.time() - start
     print(color(f"\n  Listo: {len(results)} puertos abiertos en {total:.1f}s", GREEN))
 
-    out_dir = args.output
-    if out_dir is None:
-        dirname = ip.replace(".", "_")
-        out_dir = os.path.join(os.getcwd(), f"netscope_{dirname}")
-    try:
-        os.makedirs(out_dir, exist_ok=True)
-        with open(os.path.join(out_dir, "allPorts.txt"), "w", encoding="utf-8") as fh:
-            fh.write(grepable(ip, results) + "\n")
-        with open(os.path.join(out_dir, "targeted.txt"), "w", encoding="utf-8") as fh:
-            fh.write(targeted_report(args.target, ip, results, total))
-        print(color(f"  Guardado en {out_dir}/  (allPorts.txt, targeted.txt)\n", GRAY))
-    except OSError as exc:
-        print(color(f"  [!] No se pudieron guardar los informes: {exc}\n", YELLOW))
+    print_next_steps(ip, results)
 
     return 0
 
