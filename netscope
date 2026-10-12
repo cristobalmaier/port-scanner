@@ -255,10 +255,13 @@ def color(text, code):
 
 def version_string(item):
     v = " ".join(x for x in (item["product"], item["version"]) if x).strip()
+    extra = ""
     if item["http"].get("title"):
-        v = (v + f' — "{item["http"]["title"]}"').strip()
+        extra = f'"{item["http"]["title"]}"'
     elif item["tls"]:
-        v = (v + f" — {item['tls']}").strip()
+        extra = item["tls"]
+    if extra:
+        v = f"{v} — {extra}" if v else extra
     return v
 
 
